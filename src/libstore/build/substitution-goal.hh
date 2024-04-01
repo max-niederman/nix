@@ -17,12 +17,6 @@ struct PathSubstitutionGoal : public Goal
     StorePath storePath;
 
     /**
-     * The path the substituter refers to the path as. This will be
-     * different when the stores have different names.
-     */
-    std::optional<StorePath> subPath;
-
-    /**
      * The remaining substituters.
      */
     std::list<ref<Store>> subs;
@@ -31,6 +25,11 @@ struct PathSubstitutionGoal : public Goal
      * The current substituter.
      */
     std::shared_ptr<Store> sub;
+
+    /**
+     * Queries for the path info of the store path on each remaining substituter.
+     */
+    std::list<std::future<ref<const ValidPathInfo>>> infoQueries;
 
     /**
      * Whether a substituter failed.

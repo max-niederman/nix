@@ -3,6 +3,7 @@
 #include "nar-info.hh"
 #include "finally.hh"
 #include "signals.hh"
+#include "callback.hh"
 
 namespace nix {
 
@@ -62,14 +63,6 @@ void PathSubstitutionGoal::init()
 
     subs = settings.useSubstitutes ? getDefaultSubstituters() : std::list<ref<Store>>();
 
-    tryNext();
-}
-
-
-void PathSubstitutionGoal::tryNext()
-{
-    trace("trying next substituter");
-
     cleanup();
 
     if (subs.size() == 0) {
@@ -92,23 +85,49 @@ void PathSubstitutionGoal::tryNext()
         return;
     }
 
+    for (auto sub : subs) {
+        StorePath subPath = storePath;
+
+        if (ca) {
+            subPath = sub->makeFixedOutputPathFromCA(
+                std::string{storePath.name()}, ContentAddressWithReferences::withoutRefs(*ca));
+            if (sub->storeDir == worker.store.storeDir)
+                assert(subPath == storePath);
+        } else if (sub->storeDir != worker.store.storeDir) {
+            break;
+        }
+
+        std::promise<ref<const ValidPathInfo>> promise;
+
+        sub->queryPathInfo(subPath,
+            {[&](std::future<ref<const ValidPathInfo>> result) {
+                try {
+                    promise.set_value(result.get());
+                } catch (...) {
+                    promise.set_exception(std::current_exception());
+                }
+            }});
+
+        infoQueries.push_back(promise.get_future());
+    }
+
+    state = &PathSubstitutionGoal::tryNext;
+}
+
+void PathSubstitutionGoal::tryNext()
+{
+    trace("trying next substituter");
+
+    /* Wait for the highest-priority substituter to respond. */
+    if (infoQueries.front().wait_for(std::chrono::seconds::zero()) == std::future_status::timeout)
+        return;
+
     sub = subs.front();
     subs.pop_front();
 
-    if (ca) {
-        subPath = sub->makeFixedOutputPathFromCA(
-            std::string { storePath.name() },
-            ContentAddressWithReferences::withoutRefs(*ca));
-        if (sub->storeDir == worker.store.storeDir)
-            assert(subPath == storePath);
-    } else if (sub->storeDir != worker.store.storeDir) {
-        tryNext();
-        return;
-    }
-
     try {
-        // FIXME: make async
-        info = sub->queryPathInfo(subPath ? *subPath : storePath);
+        info = infoQueries.front().get();
+        infoQueries.pop_front();
     } catch (InvalidPath &) {
         tryNext();
         return;
@@ -226,8 +245,14 @@ void PathSubstitutionGoal::tryToRun()
             Activity act(*logger, actSubstitute, Logger::Fields{worker.store.printStorePath(storePath), sub->getUri()});
             PushActivity pact(act.id);
 
-            copyStorePath(*sub, worker.store,
-                subPath ? *subPath : storePath, repair, sub->isTrusted ? NoCheckSigs : CheckSigs);
+            StorePath subPath = storePath;
+            if (ca) {
+                subPath = sub->makeFixedOutputPathFromCA(
+                    std::string { storePath.name() },
+                    ContentAddressWithReferences::withoutRefs(*ca));
+            }
+
+            copyStorePath(*sub, worker.store, subPath, repair, sub->isTrusted ? NoCheckSigs : CheckSigs);
 
             promise.set_value();
         } catch (...) {
